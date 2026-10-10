@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     app_name: str = "Bulk Certificate Generator"
     environment: str = "development"
     debug: bool = False
+    database_url: str = "sqlite:///./bulk_certificates.db"
+    sqlite_busy_timeout_seconds: float = 10.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

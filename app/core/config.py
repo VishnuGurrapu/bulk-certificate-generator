@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     debug: bool = False
     database_url: str = "sqlite:///./bulk_certificates.db"
     sqlite_busy_timeout_seconds: float = 10.0
+    storage_dir: str = "storage/certificates"
 
     model_config = SettingsConfigDict(
         env_file=".env",

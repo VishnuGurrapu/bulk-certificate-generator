@@ -6,29 +6,55 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
 ---
 
 ## Current Implementation Status
-* **Current Stage**: Stage 2 — Database Foundation
+* **Current Stage**: Stage 3 — Standalone Certificate PDF Generation Engine
 * **Implemented Components**:
   * Clean, modular project structure with separated concern boundaries.
-  * Application configuration using Pydantic Settings with environment variable support.
+  * Application configuration using Pydantic Settings with environment variable support (`storage_dir`, `database_url`).
   * FastAPI application entrypoint with interactive API documentation at `/docs`.
   * Operational health check endpoint at `GET /health`.
-  * SQLAlchemy 2.0 database engine, declarative Base, and session factories with SQLite WAL mode and foreign-key enforcement (`PRAGMA foreign_keys=ON;`).
-  * Database domain models:
-    * `GenerationJob`: Job tracking with explicit lifecycle states (`PENDING`, `PROCESSING`, `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED`) and progress counters (`total_count`, `processed_count`, `successful_count`, `failed_count`).
-    * `RecipientCertificate`: Recipient status (`PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`), unique certificate code, nullable PDF storage path, and error message tracking.
-  * Database initialization function (`init_db`) with metadata registration.
-  * Comprehensive automated test suite (Pytest + HTTPX) covering database persistence, constraints, foreign-key enforcement, cascading deletions, cross-session updates, and API health.
+  * SQLAlchemy 2.0 database engine, declarative Base, and session factories with SQLite WAL mode, foreign-key enforcement, and `UTCDateTime` normalization.
+  * Database domain models: `GenerationJob` (with counter check constraints) and `RecipientCertificate`.
+  * Standalone PDF Generation Engine (`CertificateGeneratorService` in `app/services/certificate_generator.py`):
+    * ReportLab pure-Python vector PDF rendering on landscape Letter layout.
+    * Single predefined, professional certificate template with double borders, decorative accents, and signature lines.
+    * Dynamic text fitting that scales down font sizes for long recipient or event names without overflowing.
+    * Server-side unique certificate code generation (`CERT-XXXXXX-XXXXXX`).
+    * UUID-based safe filenames and path-traversal prevention.
+    * Injected storage directory support for test isolation.
+    * Atomic file creation via temporary files (`.pdf.tmp`) with automatic error cleanup.
+  * Comprehensive automated test suite (30 passing tests) verifying PDF validity, metadata extraction via `pypdf`, uniqueness, security boundaries, database invariants, and API health.
 * **Not Yet Implemented**:
-  * ReportLab certificate template and PDF generation.
-  * Background processing worker.
-  * Bulk job submission, status tracking, and download APIs.
+  * Background processing worker and queue orchestration.
+  * Bulk job submission and status inspection endpoints.
+  * Certificate download endpoints.
+
+---
+
+## PDF Generation Engine Architecture
+
+The certificate generator is completely decoupled from HTTP routing and database transactions. It can be invoked directly as a pure domain service.
+
+### 1. Template Specifications
+* **Page Dimensions**: Standard landscape Letter (792 x 612 pt).
+* **Color Palette**: Deep Navy (`#1A365D`), Warm Gold (`#C5A059`), Charcoal (`#2D3748`), Slate Grey (`#718096`).
+* **Visual Elements**:
+  * Outer primary border (4pt) and inner gold border (1.5pt) with corner geometric accents.
+  * Header: "CERTIFICATE OF ACHIEVEMENT" with decorative separator line.
+  * Recipient Name: Scaled dynamically to fit within a 620pt boundary; underlined with a gold accent.
+  * Body: "has successfully participated in and completed" followed by the event name.
+  * Footer: Left issuance date with signature line; right unique certificate identifier with verification line.
+
+### 2. Security & Storage Guarantees
+* **Server-Generated Codes**: Certificate identifiers are generated using cryptographically strong tokens (`secrets.token_hex`).
+* **Path Traversal Protection**: Filenames are strictly validated against directory separators (`/`, `\`, `..`). All target paths must resolve strictly within the configured storage directory (`is_relative_to(storage_dir)`).
+* **Atomic File Writing**: PDFs are initially rendered to a `.pdf.tmp` file and atomically renamed upon successful completion. Any rendering or disk failure immediately deletes partial files and raises `CertificateGenerationError`.
 
 ---
 
 ## Database Architecture & Models
 
 ### 1. `generation_jobs` Table
-Stores bulk certificate generation requests and high-level progress telemetry.
+Stores bulk certificate generation requests and progress telemetry.
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
@@ -42,13 +68,6 @@ Stores bulk certificate generation requests and high-level progress telemetry.
 | `created_at` | `DATETIME (UTC)` | Timestamp when the job was accepted and persisted. |
 | `started_at` | `DATETIME (UTC)` | Nullable timestamp when the background worker began processing. |
 | `completed_at` | `DATETIME (UTC)` | Nullable timestamp when the batch finished processing. |
-
-#### Lifecycle State Semantics
-* `PENDING`: Job is persisted and enqueued; worker has not yet picked it up.
-* `PROCESSING`: Worker is actively processing and rendering recipient certificates.
-* `COMPLETED`: All recipients succeeded (`successful_count == total_count`).
-* `PARTIALLY_COMPLETED`: Processing finished, but at least one recipient failed and at least one succeeded (`successful_count > 0` and `failed_count > 0`).
-* `FAILED`: Every recipient failed (`failed_count == total_count`) or an unhandled job-level exception aborted processing.
 
 ### 2. `recipient_certificates` Table
 Stores individual participant records and their certificate generation outcomes.
@@ -66,14 +85,6 @@ Stores individual participant records and their certificate generation outcomes.
 | `created_at` | `DATETIME (UTC)` | Timestamp when the record was created. |
 | `processed_at` | `DATETIME (UTC)` | Nullable timestamp when processing completed or failed. |
 
-### 3. Relationships & Constraints
-* **One-to-Many**: One `GenerationJob` has many `RecipientCertificate` records (`job.recipients`).
-* **Cascade Delete**: Deleting a job automatically cascades to remove all associated recipient certificates.
-* **Foreign Key Constraints**: Enforced at the SQLite connection level via `PRAGMA foreign_keys=ON;`.
-* **Counter Invariants (CheckConstraints)**: Enforced directly on `generation_jobs`: non-negative counters, `processed_count = successful_count + failed_count`, and `processed_count <= total_count`.
-* **Timezone Safety**: Custom `UTCDateTime` TypeDecorator ensures all timestamps retain `tzinfo=timezone.utc` when stored and reloaded from SQLite.
-* **Concurrency & Safety**: Database connections are configured with busy timeouts (default 10s) and SQLite Write-Ahead Logging (`PRAGMA journal_mode=WAL;`). Transactions are strictly separated from CPU-bound PDF rendering work.
-
 ---
 
 ## Prerequisites
@@ -86,7 +97,6 @@ Stores individual participant records and their certificate generation outcomes.
 ## Setup Instructions (Windows PowerShell)
 
 ### 1. Clone or Open the Repository
-Ensure your terminal is in the repository root directory:
 ```powershell
 cd c:\vishnuprojects\aereoAssignment
 ```
@@ -95,16 +105,13 @@ cd c:\vishnuprojects\aereoAssignment
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
-*(If script execution is restricted on your system, enable it for the current process: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`)*
 
 ### 3. Install Dependencies
-Install or update dependencies inside the virtual environment:
 ```powershell
 pip install -r requirements.txt
 ```
 
 ### 4. Configure Environment Variables (Optional)
-Copy the safe default environment configuration:
 ```powershell
 Copy-Item .env.example .env
 ```
@@ -113,29 +120,22 @@ Copy-Item .env.example .env
 
 ## Running the Application
 
-Start the local development server using Uvicorn:
+Start the development server using Uvicorn:
 ```powershell
 uvicorn app.main:app --reload
 ```
-
-The application will start at `http://127.0.0.1:8000`.
 
 ---
 
 ## Verifying the Application
 
 ### Test the Health Endpoint
-In PowerShell, execute:
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8000/health
 ```
-Expected output:
-```json
-{"status": "ok"}
-```
 
 ### Access Interactive Documentation (Swagger UI)
-Open your web browser and navigate to:
+Navigate to:
 ```
 http://127.0.0.1:8000/docs
 ```
@@ -144,12 +144,17 @@ http://127.0.0.1:8000/docs
 
 ## Running the Automated Tests
 
-Run the full test suite (database persistence + API health check) using `pytest`:
+Run the full automated test suite:
 ```powershell
 pytest -v
 ```
 
-To run only the database tests:
+Run only the certificate generator engine tests:
+```powershell
+pytest tests/test_certificate_generator.py -v
+```
+
+Run only the database persistence tests:
 ```powershell
 pytest tests/test_database.py -v
 ```

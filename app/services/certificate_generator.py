@@ -19,6 +19,12 @@ class CertificateGenerationError(Exception):
     pass
 
 
+class CertificateFileExistsError(CertificateGenerationError, FileExistsError):
+    """Raised when the target certificate output file already exists."""
+
+    pass
+
+
 @dataclass(frozen=True)
 class CertificateGenerationResult:
     """Result data structure returned after successfully rendering a certificate PDF."""
@@ -114,6 +120,12 @@ class CertificateGeneratorService:
         # Resolve output path securely
         target_path = self._resolve_safe_path(filename)
 
+        # Refuse to overwrite an existing certificate file to preserve data integrity
+        if target_path.exists():
+            raise CertificateFileExistsError(
+                f"Target certificate file already exists: {target_path.name}"
+            )
+
         # Ensure target directory exists
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +136,7 @@ class CertificateGeneratorService:
 
         # Write to temporary file first for atomic creation
         temp_path = target_path.with_suffix(".pdf.tmp")
+        target_created = False
 
         try:
             self._render_pdf(
@@ -136,6 +149,7 @@ class CertificateGeneratorService:
 
             # Atomic rename to final destination
             temp_path.replace(target_path)
+            target_created = True
 
             return CertificateGenerationResult(
                 certificate_code=certificate_code,
@@ -143,19 +157,20 @@ class CertificateGeneratorService:
                 filename=target_path.name,
             )
         except Exception as e:
-            # Clean up incomplete files on failure
+            # Clean up temporary file created by this operation
             if temp_path.exists():
                 try:
                     temp_path.unlink()
                 except OSError:
                     pass
-            if target_path.exists():
+            # Only clean up target_path if it was actually created during this operation
+            if target_created and target_path.exists():
                 try:
                     target_path.unlink()
                 except OSError:
                     pass
 
-            if isinstance(e, (ValueError, TypeError)):
+            if isinstance(e, (ValueError, TypeError, CertificateGenerationError)):
                 raise
             raise CertificateGenerationError(
                 f"Failed to generate certificate PDF: {e}"

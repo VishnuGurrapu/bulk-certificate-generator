@@ -6,6 +6,7 @@ import pypdf
 import pytest
 
 from app.services.certificate_generator import (
+    CertificateFileExistsError,
     CertificateGenerationError,
     CertificateGenerationResult,
     CertificateGeneratorService,
@@ -207,3 +208,53 @@ def test_custom_code_and_date_types_supported(
     extracted = reader.pages[0].extract_text()
     assert custom_code in extracted
     assert "December 25, 2026" in extracted
+
+
+def test_generate_fails_when_target_file_already_exists(
+    generator: CertificateGeneratorService, temp_storage: Path
+) -> None:
+    """Regression test: verify generation refuses to overwrite pre-existing file and leaves it intact."""
+    existing_file = temp_storage / "pre_existing.pdf"
+    original_content = b"%PDF-pre-existing-content"
+    existing_file.write_bytes(original_content)
+
+    with pytest.raises(
+        CertificateFileExistsError, match="Target certificate file already exists"
+    ):
+        generator.generate_certificate(
+            recipient_name="Alice Smith",
+            event_name="Test Event",
+            output_filename="pre_existing.pdf",
+        )
+
+    # Ensure pre-existing file was NOT deleted or overwritten
+    assert existing_file.exists()
+    assert existing_file.read_bytes() == original_content
+    # Ensure no temporary files were left behind
+    assert list(temp_storage.glob("*.tmp")) == []
+
+
+def test_render_failure_does_not_delete_preexisting_files(
+    generator: CertificateGeneratorService, temp_storage: Path
+) -> None:
+    """Regression test: verify a failure during generation does not delete pre-existing neighbor files."""
+    neighbor_file = temp_storage / "neighbor.pdf"
+    neighbor_content = b"%PDF-neighbor-content"
+    neighbor_file.write_bytes(neighbor_content)
+
+    with patch.object(
+        generator, "_render_pdf", side_effect=RuntimeError("Simulated render crash")
+    ):
+        with pytest.raises(CertificateGenerationError, match="Simulated render crash"):
+            generator.generate_certificate(
+                recipient_name="Bob User",
+                event_name="Crashing Event",
+                output_filename="new_failing.pdf",
+            )
+
+    # Pre-existing neighbor must be completely intact
+    assert neighbor_file.exists()
+    assert neighbor_file.read_bytes() == neighbor_content
+    # Failed target and its temporary files must not exist
+    assert not (temp_storage / "new_failing.pdf").exists()
+    assert list(temp_storage.glob("*.tmp")) == []

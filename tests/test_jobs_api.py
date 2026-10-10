@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import Settings, get_settings
 from app.db.session import _get_connect_args, get_db, init_db
 from app.main import app
 from app.models.job import GenerationJob, JobStatus
@@ -35,8 +36,16 @@ def session_factory(test_engine):
 
 
 @pytest.fixture
-def client(session_factory) -> TestClient:
-    """Provide a FastAPI TestClient with overridden get_db dependency."""
+def temp_storage_dir(tmp_path: Path) -> Path:
+    """Provide a temporary directory for certificate PDF storage in API tests."""
+    storage = tmp_path / "storage" / "certificates"
+    storage.mkdir(parents=True, exist_ok=True)
+    return storage
+
+
+@pytest.fixture
+def client(session_factory, temp_storage_dir: Path) -> TestClient:
+    """Provide a FastAPI TestClient with overridden get_db and get_settings dependencies."""
 
     def override_get_db():
         db = session_factory()
@@ -45,10 +54,15 @@ def client(session_factory) -> TestClient:
         finally:
             db.close()
 
+    def override_get_settings():
+        return Settings(storage_dir=str(temp_storage_dir))
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_settings] = override_get_settings
     test_client = TestClient(app)
     yield test_client
     app.dependency_overrides.clear()
+
 
 
 def test_create_job_success(client: TestClient, session_factory) -> None:
@@ -258,3 +272,167 @@ def test_get_job_status_invalid_uuid(client: TestClient) -> None:
     """Verify GET /jobs/{job_id} returns 422 for malformed UUID in path."""
     response = client.get("/jobs/not-a-valid-uuid")
     assert response.status_code == 422
+
+
+def test_get_certificate_success(client: TestClient, session_factory, temp_storage_dir: Path) -> None:
+    """Verify GET /jobs/{job_id}/recipients/{recipient_id}/certificate returns 200 with PDF payload."""
+    pdf_filename = "cert_alice.pdf"
+    pdf_file = temp_storage_dir / pdf_filename
+    pdf_content = b"%PDF-1.4 mock binary certificate content"
+    pdf_file.write_bytes(pdf_content)
+
+    with session_factory() as session:
+        job = GenerationJob(event_name="Graduation Ceremony", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        recipient = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Alice Johnson",
+            recipient_email="alice@example.com",
+            status=RecipientStatus.COMPLETED,
+            certificate_code="CERT-ALICE-123",
+            pdf_path=pdf_filename,
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+
+    response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert "attachment; filename=\"CERT-ALICE-123.pdf\"" in response.headers.get("content-disposition", "")
+    assert response.content == pdf_content
+
+
+def test_get_certificate_unknown_job(client: TestClient, session_factory) -> None:
+    """Verify 404 when requested job_id does not exist."""
+    random_job_id = uuid.uuid4()
+    random_recipient_id = uuid.uuid4()
+    response = client.get(f"/jobs/{random_job_id}/recipients/{random_recipient_id}/certificate")
+    assert response.status_code == 404
+    assert f"Job with ID '{random_job_id}' not found." in response.json()["detail"]
+
+
+def test_get_certificate_unknown_recipient(client: TestClient, session_factory) -> None:
+    """Verify 404 when recipient_id does not exist in the requested job."""
+    with session_factory() as session:
+        job = GenerationJob(event_name="Summit", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    random_recipient_id = uuid.uuid4()
+    response = client.get(f"/jobs/{job_id}/recipients/{random_recipient_id}/certificate")
+    assert response.status_code == 404
+    assert f"Recipient with ID '{random_recipient_id}' not found for job '{job_id}'." in response.json()["detail"]
+
+
+def test_get_certificate_recipient_belongs_to_different_job(client: TestClient, session_factory) -> None:
+    """Verify 404 when recipient exists but belongs to a different job."""
+    with session_factory() as session:
+        job_1 = GenerationJob(event_name="Job 1", total_count=1)
+        job_2 = GenerationJob(event_name="Job 2", total_count=1)
+        session.add_all([job_1, job_2])
+        session.commit()
+
+        recipient = RecipientCertificate(
+            job_id=job_1.id,
+            recipient_name="User",
+            recipient_email="user@test.com",
+            status=RecipientStatus.COMPLETED,
+            pdf_path="test.pdf",
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+        job_2_id = job_2.id
+
+    # Request recipient under job_2
+    response = client.get(f"/jobs/{job_2_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 404
+    assert f"Recipient with ID '{recipient_id}' not found for job '{job_2_id}'." in response.json()["detail"]
+
+
+@pytest.mark.parametrize("status_val", [RecipientStatus.PENDING, RecipientStatus.PROCESSING, RecipientStatus.FAILED])
+def test_get_certificate_not_completed_returns_400(client: TestClient, session_factory, status_val) -> None:
+    """Verify 400 Bad Request when certificate generation is not in COMPLETED status."""
+    with session_factory() as session:
+        job = GenerationJob(event_name="Ongoing Workshop", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        recipient = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Pending User",
+            recipient_email="pending@test.com",
+            status=status_val,
+            error_message="Font rendering failed" if status_val == RecipientStatus.FAILED else None,
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+
+    response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert f"Certificate for recipient '{recipient_id}' is not available." in detail
+    assert status_val.value in detail
+
+
+def test_get_certificate_file_missing_on_disk_returns_404(client: TestClient, session_factory) -> None:
+    """Verify 404 when record is COMPLETED but physical PDF file is missing from storage."""
+    with session_factory() as session:
+        job = GenerationJob(event_name="Ghost File Event", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        recipient = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Ghost User",
+            recipient_email="ghost@test.com",
+            status=RecipientStatus.COMPLETED,
+            certificate_code="CERT-GHOST-1",
+            pdf_path="non_existent_file.pdf",
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+
+    response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 404
+    assert "Certificate file not found on storage." in response.json()["detail"]
+
+
+def test_get_certificate_path_traversal_returns_404(
+    client: TestClient, session_factory, tmp_path: Path
+) -> None:
+    """Verify 404 when recipient pdf_path attempts directory traversal outside storage."""
+    # Create a secret file outside the configured storage directory
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("classified data")
+
+    with session_factory() as session:
+        job = GenerationJob(event_name="Traversal Event", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        recipient = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Hacker",
+            recipient_email="hack@test.com",
+            status=RecipientStatus.COMPLETED,
+            certificate_code="CERT-HACK-1",
+            pdf_path="../../secret.txt",
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+
+    response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 404
+    assert "Certificate file path is invalid." in response.json()["detail"]

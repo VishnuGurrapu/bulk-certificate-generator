@@ -1,18 +1,22 @@
 import uuid
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings, get_settings
 from app.db.session import get_db
 from app.models.job import GenerationJob, JobStatus
-from app.models.recipient import RecipientCertificate
+from app.models.recipient import RecipientCertificate, RecipientStatus
 from app.schemas.job import (
     JobCreateRequest,
     JobCreateResponse,
     JobStatusResponse,
 )
 from app.services.job_processor import MAX_RECIPIENTS_PER_JOB
+
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
@@ -106,4 +110,91 @@ def get_job_status(
         created_at=job.created_at,
         started_at=job.started_at,
         completed_at=job.completed_at,
+    )
+
+
+@router.get(
+    "/{job_id}/recipients/{recipient_id}/certificate",
+    response_class=FileResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Download recipient certificate PDF",
+    description="Serves the generated PDF certificate for a recipient belonging to the specified generation job.",
+)
+def get_recipient_certificate(
+    job_id: uuid.UUID,
+    recipient_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> FileResponse:
+    """Retrieve and download a successfully generated certificate PDF.
+
+    Validates:
+    - Job exists (404).
+    - Recipient exists (404).
+    - Recipient belongs to the requested job (404).
+    - Certificate generation status is COMPLETED (400 if pending/processing/failed).
+    - Stored path is secure, within storage directory, and exists on disk (404 if missing or invalid).
+    """
+    job = db.get(GenerationJob, job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found.",
+        )
+
+    recipient = db.get(RecipientCertificate, recipient_id)
+    if recipient is None or recipient.job_id != job_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Recipient with ID '{recipient_id}' not found for job '{job_id}'.",
+        )
+
+    if recipient.status != RecipientStatus.COMPLETED or not recipient.pdf_path:
+        error_detail = (
+            f"Certificate for recipient '{recipient_id}' is not available. Status: '{recipient.status.value}'."
+        )
+        if recipient.error_message:
+            error_detail += f" Error: {recipient.error_message}"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_detail,
+        )
+
+    # Validate file path securely
+    base_storage = Path(settings.storage_dir).resolve()
+    stored_path = Path(recipient.pdf_path)
+
+
+    if stored_path.is_absolute():
+        target_path = stored_path.resolve()
+    else:
+        target_path = (base_storage / stored_path).resolve()
+
+    # Path traversal validation
+    try:
+        if not target_path.is_relative_to(base_storage):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Certificate file path is invalid.",
+            )
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Certificate file path is invalid.",
+        )
+
+    if not target_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Certificate file not found on storage.",
+        )
+
+    # Construct clean download filename
+    code_part = recipient.certificate_code or str(recipient.id)
+    download_filename = f"{code_part}.pdf"
+
+    return FileResponse(
+        path=target_path,
+        media_type="application/pdf",
+        filename=download_filename,
     )

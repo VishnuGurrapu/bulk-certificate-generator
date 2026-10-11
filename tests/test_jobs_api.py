@@ -246,6 +246,9 @@ def test_get_job_status_success(client: TestClient, session_factory) -> None:
     assert data["progress_percentage"] == 50.0
     assert data["started_at"] is not None
     assert data["completed_at"] is None
+    assert "recipients" in data
+    assert isinstance(data["recipients"], list)
+
 
 
 def test_get_job_status_zero_recipients_safe(client: TestClient, session_factory) -> None:
@@ -652,3 +655,113 @@ def test_create_job_automatic_processing_partial_failure(
         assert success_rec.status == RecipientStatus.COMPLETED
         assert success_rec.pdf_path is not None
         assert (temp_storage_dir / success_rec.pdf_path).exists()
+
+
+def test_get_job_status_includes_recipients_with_expected_fields(
+    client: TestClient, session_factory
+) -> None:
+    """Verify GET /jobs/{job_id} includes recipients array with recipient_id, name, email, and status."""
+    with session_factory() as session:
+        job = GenerationJob(
+            event_name="Full Stack Web Dev Workshop",
+            total_count=2,
+            processed_count=1,
+            successful_count=1,
+            failed_count=0,
+            status=JobStatus.PROCESSING,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        rec1 = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Grace Hopper",
+            recipient_email="grace@example.com",
+            status=RecipientStatus.COMPLETED,
+            certificate_code="CERT-GRACE-001",
+            pdf_path="certificates/grace.pdf",
+        )
+        rec2 = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Alan Turing",
+            recipient_email="alan@example.com",
+            status=RecipientStatus.PENDING,
+        )
+        session.add_all([rec1, rec2])
+        session.commit()
+
+    response = client.get(f"/jobs/{job_id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "recipients" in data
+    assert len(data["recipients"]) == 2
+
+    recipients_by_email = {r["email"]: r for r in data["recipients"]}
+    assert "grace@example.com" in recipients_by_email
+    assert "alan@example.com" in recipients_by_email
+
+    grace = recipients_by_email["grace@example.com"]
+    # Check that recipient_id is a valid UUID
+    grace_id = uuid.UUID(grace["recipient_id"])
+    assert grace_id is not None
+    assert grace["name"] == "Grace Hopper"
+    assert grace["email"] == "grace@example.com"
+    assert grace["status"] == "COMPLETED"
+
+    # Confirm only intended public fields are exposed; no sensitive/internal DB fields
+    expected_fields = {"recipient_id", "name", "email", "status"}
+    assert set(grace.keys()) == expected_fields
+
+    alan = recipients_by_email["alan@example.com"]
+    alan_id = uuid.UUID(alan["recipient_id"])
+    assert alan_id is not None
+    assert alan["name"] == "Alan Turing"
+    assert alan["email"] == "alan@example.com"
+    assert alan["status"] == "PENDING"
+    assert set(alan.keys()) == expected_fields
+
+
+def test_get_job_status_recipient_id_works_with_certificate_download(
+    client: TestClient, session_factory
+) -> None:
+    """Verify that recipient_id obtained from GET /jobs/{job_id} works directly with certificate download endpoint."""
+    payload = {
+        "event_name": "API Usability Testing Summit",
+        "recipients": [
+            {"name": "Ada Lovelace", "email": "ada@example.com"},
+        ],
+    }
+
+    # Step 1: Create job and let automatic background processing execute
+    create_res = client.post("/jobs", json=payload)
+    assert create_res.status_code == 201
+    job_id = create_res.json()["id"]
+
+    # Step 2: Retrieve job status
+    status_res = client.get(f"/jobs/{job_id}")
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["status"] == "COMPLETED"
+    assert len(status_data["recipients"]) == 1
+
+    recipient = status_data["recipients"][0]
+    recipient_id = recipient["recipient_id"]
+    assert recipient["name"] == "Ada Lovelace"
+    assert recipient["status"] == "COMPLETED"
+
+    # Step 3: Use the recipient_id from the job status response to download the certificate
+    download_res = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert download_res.status_code == 200
+    assert download_res.headers["content-type"] == "application/pdf"
+    assert "attachment" in download_res.headers.get("content-disposition", "")
+    assert len(download_res.content) > 0
+
+    # Verify the downloaded PDF is valid
+    from io import BytesIO
+    reader = pypdf.PdfReader(BytesIO(download_res.content))
+    assert len(reader.pages) == 1
+    page_text = reader.pages[0].extract_text()
+    assert "Ada Lovelace" in page_text
+    assert "API Usability Testing Summit" in page_text

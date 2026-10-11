@@ -6,6 +6,7 @@ from typing import Annotated, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.job import JobStatus
+from app.models.recipient import RecipientStatus
 from app.services.job_processor import MAX_RECIPIENTS_PER_JOB
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -59,6 +60,22 @@ class JobCreateResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class JobRecipientResponse(BaseModel):
+    """Schema for an individual recipient in a job status query."""
+
+    recipient_id: uuid.UUID = Field(description="Unique recipient identifier for certificate retrieval")
+    name: str = Field(description="Full name of recipient")
+    email: str = Field(description="Email address of recipient")
+    status: RecipientStatus = Field(description="Status of recipient certificate generation")
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @property
+    def id(self) -> uuid.UUID:
+        """Convenience property alias for recipient_id."""
+        return self.recipient_id
+
+
 class JobStatusResponse(BaseModel):
     """Response schema for querying job status and progress."""
 
@@ -76,5 +93,9 @@ class JobStatusResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    recipients: list[JobRecipientResponse] = Field(
+        default_factory=list,
+        description="List of recipients and their generation status",
+    )
 
     model_config = ConfigDict(from_attributes=True)

@@ -16,6 +16,7 @@ from app.models.recipient import RecipientCertificate, RecipientStatus
 from app.schemas.job import (
     JobCreateRequest,
     JobCreateResponse,
+    JobRecipientResponse,
     JobStatusResponse,
 )
 from app.services.certificate_generator import CertificateGeneratorService
@@ -153,6 +154,16 @@ def get_job_status(
     else:
         progress = round((job.processed_count / job.total_count) * 100.0, 2)
 
+    recipients_list = [
+        JobRecipientResponse(
+            recipient_id=r.id,
+            name=r.recipient_name,
+            email=r.recipient_email,
+            status=r.status,
+        )
+        for r in job.recipients
+    ]
+
     return JobStatusResponse(
         id=job.id,
         event_name=job.event_name,
@@ -166,6 +177,7 @@ def get_job_status(
         created_at=job.created_at,
         started_at=job.started_at,
         completed_at=job.completed_at,
+        recipients=recipients_list,
     )
 
 

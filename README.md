@@ -30,7 +30,7 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
     * Safe orphan-file cleanup if database commits fail.
   * REST API Layer (`app/api/jobs.py`):
     * `POST /jobs`: Validates input, atomically persists job and recipient records, and immediately schedules in-process background processing.
-    * `GET /jobs/{job_id}`: Tracks live progress, counter metrics, and completion percentage.
+    * `GET /jobs/{job_id}`: Tracks live progress, counter metrics, completion percentage, and recipient summaries (`recipient_id`, `name`, `email`, `status`).
     * `GET /jobs/{job_id}/recipients/{recipient_id}/certificate`: Securely streams generated certificate PDFs with strict storage containment checks and sanitized public error messages.
   * Automatic In-Process Background Processing via FastAPI `BackgroundTasks`.
   * Comprehensive automated test suite (75 passing tests) verifying PDF validity, metadata extraction, uniqueness, security boundaries, database invariants, reliable processing, error sanitization, and API workflows.
@@ -223,25 +223,29 @@ Example response (`200 OK`):
   "progress_percentage": 100.0,
   "recipients": [
     {
-      "id": "4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e",
-      "recipient_name": "Alice Smith",
-      "recipient_email": "alice@example.com",
-      "status": "COMPLETED",
-      "certificate_code": "CERT-A1B2C3-D4E5F6",
-      "pdf_path": "certificates/4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e.pdf",
-      "error_message": null,
-      "created_at": "2026-10-11T06:05:27.123456Z",
-      "processed_at": "2026-10-11T06:05:27.350000Z"
+      "recipient_id": "4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e",
+      "name": "Alice Smith",
+      "email": "alice@example.com",
+      "status": "COMPLETED"
+    },
+    {
+      "recipient_id": "8c21a412-2d1b-4fa8-bb32-11c5f89104b2",
+      "name": "Bob Jones",
+      "email": "bob@example.com",
+      "status": "COMPLETED"
     }
   ]
 }
 ```
 
 #### 3. Download a Generated Certificate (`GET /jobs/{job_id}/recipients/{recipient_id}/certificate`)
-Retrieve and save the rendered vector PDF file for a completed recipient:
+Extract the recipient ID from the job-status response and download the rendered vector PDF file for that recipient:
 
 ```powershell
-$recipientId = $status.recipients[0].id
+# Extract recipient ID from the job status response
+$recipientId = $status.recipients[0].recipient_id
+
+# Download and save the certificate PDF
 Invoke-WebRequest -Uri "http://127.0.0.1:8000/jobs/$($job.id)/recipients/$recipientId/certificate" -OutFile "alice_certificate.pdf"
 ```
 

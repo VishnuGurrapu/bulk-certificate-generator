@@ -101,6 +101,21 @@ class RecipientCertificate(Base):
         back_populates="recipients",
     )
 
+    @property
+    def recipient_id(self) -> uuid.UUID:
+        """Convenience property matching API schema field."""
+        return self.id
+
+    @property
+    def name(self) -> str:
+        """Convenience property matching API schema field."""
+        return self.recipient_name
+
+    @property
+    def email(self) -> str:
+        """Convenience property matching API schema field."""
+        return self.recipient_email
+
     def __repr__(self) -> str:
         return (
             f"<RecipientCertificate(id={self.id}, job_id={self.job_id}, "

@@ -3,6 +3,7 @@
 from app.schemas.job import (
     JobCreateRequest,
     JobCreateResponse,
+    JobRecipientResponse,
     JobStatusResponse,
     RecipientCreate,
 )
@@ -10,6 +11,7 @@ from app.schemas.job import (
 __all__ = [
     "JobCreateRequest",
     "JobCreateResponse",
+    "JobRecipientResponse",
     "JobStatusResponse",
     "RecipientCreate",
 ]

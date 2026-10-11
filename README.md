@@ -5,8 +5,9 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
 
 ---
 
-## Current Implementation Status
-* **Current Stage**: Stage 5 — Automatic Certificate Generation & End-to-End Processing
+## Project Status
+Implemented and tested. Includes bulk certificate generation, job progress tracking, and PDF retrieval.
+
 * **Implemented Components**:
   * Clean, modular project structure with separated concern boundaries.
   * Application configuration using Pydantic Settings with environment variable support (`storage_dir`, `database_url`).
@@ -176,11 +177,11 @@ Submit a certificate generation batch. The job is created and automatically begi
 
 ```powershell
 $body = @{
-    event_name = "Annual Tech Summit 2026"
-    issue_date = "2026-10-15"
+    event_name = "Test Certificate Event"
+    issue_date = "2026-10-11"
     recipients = @(
-        @{ name = "Alice Smith"; email = "alice@example.com" },
-        @{ name = "Bob Jones"; email = "bob@example.com" }
+        @{ name = "Vishnu Gurrapu"; email = "vishnu@example.com" },
+        @{ name = "Shiva Reddy"; email = "shiva@example.com" }
     )
 } | ConvertTo-Json -Depth 5
 
@@ -191,15 +192,15 @@ $job
 Example response (`201 Created`):
 ```json
 {
-  "id": "c0bc522d-3cb8-48b4-b258-29ba0e52702b",
-  "event_name": "Annual Tech Summit 2026",
-  "issue_date": "2026-10-15",
+  "id": "cd7e989c-2d94-47a3-866a-2b41f8bc4621",
+  "event_name": "Test Certificate Event",
+  "issue_date": "2026-10-11",
   "status": "PENDING",
   "total_count": 2,
   "processed_count": 0,
   "successful_count": 0,
   "failed_count": 0,
-  "created_at": "2026-10-11T06:05:27.123456Z",
+  "created_at": "2026-10-11T07:14:17.505604Z",
   "started_at": null,
   "completed_at": null
 }
@@ -217,29 +218,29 @@ $status.recipients
 Example response (`200 OK`):
 ```json
 {
-  "id": "c0bc522d-3cb8-48b4-b258-29ba0e52702b",
-  "event_name": "Annual Tech Summit 2026",
-  "issue_date": "2026-10-15",
+  "id": "cd7e989c-2d94-47a3-866a-2b41f8bc4621",
+  "event_name": "Test Certificate Event",
+  "issue_date": "2026-10-11",
   "status": "COMPLETED",
   "total_count": 2,
   "processed_count": 2,
   "successful_count": 2,
   "failed_count": 0,
-  "created_at": "2026-10-11T06:05:27.123456Z",
-  "started_at": "2026-10-11T06:05:27.200000Z",
-  "completed_at": "2026-10-11T06:05:27.500000Z",
+  "created_at": "2026-10-11T07:14:17.505604Z",
+  "started_at": "2026-10-11T07:14:17.600000Z",
+  "completed_at": "2026-10-11T07:14:18.100000Z",
   "progress_percentage": 100.0,
   "recipients": [
     {
-      "recipient_id": "4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e",
-      "name": "Alice Smith",
-      "email": "alice@example.com",
+      "recipient_id": "8f3b2049-d71c-4b5f-9204-629df2495bb3",
+      "name": "Vishnu Gurrapu",
+      "email": "vishnu@example.com",
       "status": "COMPLETED"
     },
     {
-      "recipient_id": "8c21a412-2d1b-4fa8-bb32-11c5f89104b2",
-      "name": "Bob Jones",
-      "email": "bob@example.com",
+      "recipient_id": "0350c570-ea49-4b4e-ad04-a1242b339af4",
+      "name": "Shiva Reddy",
+      "email": "shiva@example.com",
       "status": "COMPLETED"
     }
   ]
@@ -250,11 +251,11 @@ Example response (`200 OK`):
 Extract the recipient ID from the job-status response and download the rendered vector PDF file for that recipient:
 
 ```powershell
-# Extract recipient ID from the job status response
+# Extract recipient ID from the job status response (e.g. first recipient)
 $recipientId = $status.recipients[0].recipient_id
 
 # Download and save the certificate PDF
-Invoke-WebRequest -Uri "http://127.0.0.1:8000/jobs/$($job.id)/recipients/$recipientId/certificate" -OutFile "alice_certificate.pdf"
+Invoke-WebRequest -Uri "http://127.0.0.1:8000/jobs/$($job.id)/recipients/$recipientId/certificate" -OutFile "vishnu_certificate.pdf"
 ```
 
 ### Access Interactive Documentation (Swagger UI)
@@ -262,6 +263,48 @@ Navigate to:
 ```
 http://127.0.0.1:8000/docs
 ```
+
+---
+
+## Screenshots and Demo
+
+The following visual walkthrough demonstrates the service running locally in Swagger UI (`http://127.0.0.1:8000/docs`), showcasing the end-to-end workflow from API exploration to certificate issuance and download.
+
+### 1. Swagger API Overview
+Interactive OpenAPI documentation listing available job management and health endpoints:
+![Swagger API Overview](docs/screenshots/api-overview.png)
+
+### 2. Creating a Certificate Generation Job
+Submitting a certificate generation batch with event name, issue date, and recipients:
+![Creating a Certificate Generation Job](docs/screenshots/create-job.png)
+
+### 3. The 201 Created Response
+Immediate HTTP 201 response returning initial PENDING status and job metadata while background processing begins:
+![The 201 Created Response](docs/screenshots/job-created.png)
+
+Job creation response and validation schemas:
+![Job Creation Schema](docs/screenshots/job-creation-schema.png)
+
+### 4. Job-Status Response Schema with Recipient IDs
+Job status schema showing counter telemetry and recipient summaries with recipient IDs (`recipient_id`, `name`, `email`, `status`):
+![Job-Status Response Schema with Recipient IDs](docs/screenshots/job-status-schema.png)
+
+### 5. Certificate Download Request
+Invoking the download endpoint with `job_id` and `recipient_id`:
+![Certificate Download Request](docs/screenshots/certificate-download-request.png)
+
+### 6. Successful 200 OK PDF Download
+HTTP 200 response streaming the rendered vector PDF certificate as an attachment:
+![Successful 200 OK PDF Download](docs/screenshots/certificate-download-success.png)
+
+### 7. Health Check Returning 200 OK
+Operational verification endpoint returning HTTP 200 OK with service status:
+![Health Check Returning 200 OK](docs/screenshots/health-check.png)
+
+### 8. Sample Generated Certificates
+Sample vector PDF certificates rendered during local verification:
+* [Sample Certificate — Vishnu Gurrapu (PDF)](docs/screenshots/Certificate1.pdf)
+* [Sample Certificate — Shiva Reddy (PDF)](docs/screenshots/Certificate2.pdf)
 
 ---
 

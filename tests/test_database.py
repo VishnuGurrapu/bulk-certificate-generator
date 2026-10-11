@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -339,3 +339,63 @@ def test_required_database_fields_reject_null(db_session: Session) -> None:
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
+
+
+def test_init_db_adds_issue_date_to_legacy_schema(tmp_path: Path) -> None:
+    """Verify init_db safely migrates existing SQLite databases lacking the issue_date column."""
+    from sqlalchemy import text
+
+    legacy_db_path = tmp_path / "legacy.db"
+    db_url = f"sqlite:///{legacy_db_path.as_posix()}"
+    engine = create_engine(db_url, connect_args=_get_connect_args(db_url))
+
+    # Manually create table without issue_date
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE generation_jobs (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    event_name VARCHAR(255) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    total_count INTEGER NOT NULL,
+                    processed_count INTEGER NOT NULL,
+                    successful_count INTEGER NOT NULL,
+                    failed_count INTEGER NOT NULL,
+                    started_at DATETIME,
+                    completed_at DATETIME,
+                    created_at DATETIME NOT NULL
+                );
+                """
+            )
+        )
+
+    inspector = inspect(engine)
+    existing_cols = {c["name"] for c in inspector.get_columns("generation_jobs")}
+    assert "issue_date" not in existing_cols
+
+    # Run init_db on the legacy database
+    init_db(target_engine=engine)
+
+    inspector_after = inspect(engine)
+    cols_after = {c["name"] for c in inspector_after.get_columns("generation_jobs")}
+    assert "issue_date" in cols_after
+
+    # Test inserting and reading GenerationJob with issue_date
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        job = GenerationJob(
+            event_name="Migrated Event",
+            issue_date=date(2025, 12, 31),
+            total_count=1,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    with factory() as session:
+        persisted = session.get(GenerationJob, job_id)
+        assert persisted is not None
+        assert persisted.issue_date == date(2025, 12, 31)
+
+    engine.dispose()

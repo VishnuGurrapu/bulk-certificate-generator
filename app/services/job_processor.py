@@ -116,7 +116,7 @@ class JobProcessorService:
         self.session_factory = session_factory or SessionLocal
         self.generator_service = generator_service or CertificateGeneratorService()
 
-    def process_job(self, job_id: uuid.UUID) -> GenerationJob:
+    def process_job(self, job_id: Union[uuid.UUID, str]) -> GenerationJob:
         """Process a persisted generation job and render certificates for all recipients.
 
         Args:
@@ -132,6 +132,9 @@ class JobProcessorService:
             JobRecipientLimitExceededError: If the job exceeds 500 recipients.
             JobRecipientCountMismatchError: If total_count does not equal actual recipient rows.
         """
+        if isinstance(job_id, str):
+            job_id = uuid.UUID(job_id)
+
         # Step 1: Atomically claim job
         claim_time = utc_now()
         claimed = self._atomic_claim_job(job_id=job_id, started_at=claim_time)
@@ -516,7 +519,7 @@ class JobProcessorService:
 
 
 def process_generation_job(
-    job_id: uuid.UUID,
+    job_id: Union[uuid.UUID, str],
     session_factory: Optional[sessionmaker[Session]] = None,
     generator_service: Optional[CertificateGeneratorService] = None,
 ) -> GenerationJob:

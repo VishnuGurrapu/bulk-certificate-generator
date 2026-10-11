@@ -1,10 +1,13 @@
+import logging
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+logger = logging.getLogger(__name__)
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
 from app.db.session import get_db
@@ -15,10 +18,51 @@ from app.schemas.job import (
     JobCreateResponse,
     JobStatusResponse,
 )
-from app.services.job_processor import MAX_RECIPIENTS_PER_JOB
+from app.services.certificate_generator import CertificateGeneratorService
+from app.services.job_processor import (
+    MAX_RECIPIENTS_PER_JOB,
+    JobAlreadyCompletedError,
+    JobAlreadyProcessingError,
+    JobProcessorService,
+)
 
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
+
+
+def _run_job_processor_background(
+    job_id: uuid.UUID,
+    bind_engine: Any,
+    storage_dir: str,
+) -> None:
+    """Execute automatic certificate generation for a job in the background."""
+    logger.info("Starting automatic background processing for job '%s'", job_id)
+    try:
+        session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=bind_engine,
+            class_=Session,
+        )
+        generator_service = CertificateGeneratorService(storage_dir=storage_dir)
+        processor = JobProcessorService(
+            session_factory=session_factory,
+            generator_service=generator_service,
+        )
+        processor.process_job(job_id)
+        logger.info("Automatic background processing completed successfully for job '%s'", job_id)
+    except (JobAlreadyProcessingError, JobAlreadyCompletedError) as exc:
+        logger.warning(
+            "Background processing skipped for job '%s' (already claimed or terminal): %s",
+            job_id,
+            exc,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Unhandled exception during automatic background processing for job '%s': %s",
+            job_id,
+            exc,
+        )
 
 
 @router.post(
@@ -26,16 +70,18 @@ router = APIRouter(prefix="/jobs", tags=["Jobs"])
     response_model=JobCreateResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create certificate generation job",
-    description="Registers a new certificate generation job with its recipients in an atomic database transaction.",
+    description="Registers a new certificate generation job with its recipients in an atomic database transaction and triggers automatic background processing.",
 )
 def create_job(
     payload: JobCreateRequest,
     db: Annotated[Session, Depends(get_db)],
+    background_tasks: BackgroundTasks,
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> JobCreateResponse:
     """Create a certificate generation job and persist its recipients.
 
     Validates required fields, enforces recipient bounds, and guarantees atomic persistence.
-    Does not trigger synchronous PDF generation or untracked background threads.
+    Triggers automatic in-process background processing after the transaction is committed.
     """
     recipient_count = len(payload.recipients)
     if recipient_count > MAX_RECIPIENTS_PER_JOB:
@@ -47,6 +93,7 @@ def create_job(
     # Begin atomic transaction
     job = GenerationJob(
         event_name=payload.event_name,
+        issue_date=payload.issue_date,
         total_count=recipient_count,
         status=JobStatus.PENDING,
     )
@@ -64,6 +111,14 @@ def create_job(
     db.add_all(recipients)
     db.commit()
     db.refresh(job)
+
+    # Trigger automatic background processing only after database commit succeeds
+    background_tasks.add_task(
+        _run_job_processor_background,
+        job_id=job.id,
+        bind_engine=db.get_bind(),
+        storage_dir=settings.storage_dir,
+    )
 
     return JobCreateResponse.model_validate(job)
 
@@ -101,6 +156,7 @@ def get_job_status(
     return JobStatusResponse(
         id=job.id,
         event_name=job.event_name,
+        issue_date=job.issue_date,
         status=job.status,
         total_count=job.total_count,
         processed_count=job.processed_count,
@@ -150,11 +206,18 @@ def get_recipient_certificate(
         )
 
     if recipient.status != RecipientStatus.COMPLETED or not recipient.pdf_path:
+        # Sanitize error detail: do not expose internal exception stack traces or DB errors to API clients
+        if recipient.status == RecipientStatus.FAILED and recipient.error_message:
+            logger.warning(
+                "Certificate download requested for failed recipient '%s' (job '%s'). Diagnostics: %s",
+                recipient_id,
+                job_id,
+                recipient.error_message,
+            )
+
         error_detail = (
             f"Certificate for recipient '{recipient_id}' is not available. Status: '{recipient.status.value}'."
         )
-        if recipient.error_message:
-            error_detail += f" Error: {recipient.error_message}"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=error_detail,
@@ -163,6 +226,7 @@ def get_recipient_certificate(
     # Validate file path securely
     base_storage = Path(settings.storage_dir).resolve()
     stored_path = Path(recipient.pdf_path)
+
 
 
     if stored_path.is_absolute():

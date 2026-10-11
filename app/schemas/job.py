@@ -51,6 +51,7 @@ class JobCreateResponse(BaseModel):
 
     id: uuid.UUID
     event_name: str
+    issue_date: Optional[date] = None
     status: JobStatus
     total_count: int
     created_at: datetime
@@ -63,6 +64,7 @@ class JobStatusResponse(BaseModel):
 
     id: uuid.UUID
     event_name: str
+    issue_date: Optional[date] = None
     status: JobStatus
     total_count: int
     processed_count: int

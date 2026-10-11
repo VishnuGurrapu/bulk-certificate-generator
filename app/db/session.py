@@ -89,8 +89,19 @@ def init_db(target_engine: Engine | None = None) -> None:
     """Create all registered database tables in the target database.
 
     Explicitly imports app.models to ensure model metadata registration.
+    Also handles SQLite schema backward compatibility for newly added columns.
     """
     import app.models  # noqa: F401
+    from sqlalchemy import inspect, text
 
     bind_engine = target_engine or engine
     Base.metadata.create_all(bind=bind_engine)
+
+    # Ensure backward compatibility for existing SQLite databases
+    inspector = inspect(bind_engine)
+    if "generation_jobs" in inspector.get_table_names():
+        columns = {col["name"] for col in inspector.get_columns("generation_jobs")}
+        if "issue_date" not in columns:
+            with bind_engine.connect() as conn:
+                conn.execute(text("ALTER TABLE generation_jobs ADD COLUMN issue_date DATE;"))
+                conn.commit()

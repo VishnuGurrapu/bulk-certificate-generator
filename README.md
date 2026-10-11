@@ -6,14 +6,14 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
 ---
 
 ## Current Implementation Status
-* **Current Stage**: Stage 3 — Standalone Certificate PDF Generation Engine
+* **Current Stage**: Stage 5 — Automatic Certificate Generation & End-to-End Processing
 * **Implemented Components**:
   * Clean, modular project structure with separated concern boundaries.
   * Application configuration using Pydantic Settings with environment variable support (`storage_dir`, `database_url`).
   * FastAPI application entrypoint with interactive API documentation at `/docs`.
   * Operational health check endpoint at `GET /health`.
-  * SQLAlchemy 2.0 database engine, declarative Base, and session factories with SQLite WAL mode, foreign-key enforcement, and `UTCDateTime` normalization.
-  * Database domain models: `GenerationJob` (with counter check constraints) and `RecipientCertificate`.
+  * SQLAlchemy 2.0 database engine, declarative Base, and session factories with SQLite WAL mode, foreign-key enforcement, automatic schema backward compatibility for SQLite, and `UTCDateTime` normalization.
+  * Database domain models: `GenerationJob` (with counter check constraints, issue date persistence) and `RecipientCertificate`.
   * Standalone PDF Generation Engine (`CertificateGeneratorService` in `app/services/certificate_generator.py`):
     * ReportLab pure-Python vector PDF rendering on landscape Letter layout.
     * Single predefined, professional certificate template with double borders, decorative accents, and signature lines.
@@ -22,11 +22,18 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
     * UUID-based safe filenames and path-traversal prevention.
     * Injected storage directory support for test isolation.
     * Atomic file creation via temporary files (`.pdf.tmp`) with automatic error cleanup.
-  * Comprehensive automated test suite (30 passing tests) verifying PDF validity, metadata extraction via `pypdf`, uniqueness, security boundaries, database invariants, and API health.
-* **Not Yet Implemented**:
-  * Background processing worker and queue orchestration.
-  * Bulk job submission and status inspection endpoints.
-  * Certificate download endpoints.
+  * Reliable Job Processing Service (`JobProcessorService` in `app/services/job_processor.py`):
+    * Atomic job claiming using conditional database updates to prevent concurrent duplicate processing.
+    * Recipient batch validation (strict 500-recipient limit and count consistency).
+    * Independent recipient processing with isolated error handling (single failures do not abort remaining recipients).
+    * Counter reconciliation and strict invariant validation before terminal status finalization.
+    * Safe orphan-file cleanup if database commits fail.
+  * REST API Layer (`app/api/jobs.py`):
+    * `POST /jobs`: Validates input, atomically persists job and recipient records, and immediately schedules in-process background processing.
+    * `GET /jobs/{job_id}`: Tracks live progress, counter metrics, and completion percentage.
+    * `GET /jobs/{job_id}/recipients/{recipient_id}/certificate`: Securely streams generated certificate PDFs with strict storage containment checks and sanitized public error messages.
+  * Automatic In-Process Background Processing via FastAPI `BackgroundTasks`.
+  * Comprehensive automated test suite (75 passing tests) verifying PDF validity, metadata extraction, uniqueness, security boundaries, database invariants, reliable processing, error sanitization, and API workflows.
 
 ---
 
@@ -60,6 +67,7 @@ Stores bulk certificate generation requests and progress telemetry.
 | :--- | :--- | :--- |
 | `id` | `UUID` (PK) | Globally unique identifier for the bulk job. |
 | `event_name` | `VARCHAR(255)` | Name of the event or course for which certificates are issued. |
+| `issue_date` | `DATE` | Nullable requested certificate issuance date printed on all certificates. |
 | `status` | `ENUM` | Current lifecycle state: `PENDING`, `PROCESSING`, `COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED`. |
 | `total_count` | `INTEGER` | Total number of recipient certificates requested in the batch. |
 | `processed_count` | `INTEGER` | Total recipients processed so far (`successful_count + failed_count`). |
@@ -84,6 +92,25 @@ Stores individual participant records and their certificate generation outcomes.
 | `error_message` | `VARCHAR(1000)`| Nullable error explanation if generation failed for this recipient. |
 | `created_at` | `DATETIME (UTC)` | Timestamp when the record was created. |
 | `processed_at` | `DATETIME (UTC)` | Nullable timestamp when processing completed or failed. |
+
+---
+
+## Background Processing Architecture & Operational Constraints
+
+When a client calls `POST /jobs`, the application creates the job, persists its recipients, commits the database transaction, and automatically schedules the job processor in the background.
+
+### 1. In-Process Execution via FastAPI `BackgroundTasks`
+* **Triggering**: Automatic processing is scheduled using FastAPI's standard in-process `BackgroundTasks` after the creation transaction commits.
+* **Non-Blocking**: The HTTP request returns immediately with `201 Created` and initial `PENDING` status, keeping the API responsive for clients.
+* **Concurrency Protection**: The background processor reuses the service's atomic claim mechanism (`UPDATE generation_jobs SET status = 'PROCESSING' WHERE id = :id AND status = 'PENDING'`). Duplicate triggers or concurrent workers cannot claim or process the same job twice.
+* **Fault Isolation**: Each recipient in the batch is processed independently. A rendering or data failure for one recipient does not stop processing for subsequent recipients.
+
+### 2. Operational Limitations & Non-Durable Queue Notice
+> [!WARNING]
+> **In-Process Background Task Lifecycle & Volatility**:
+> Automatic processing executes in-process within the running application process. If the application server process crashes, terminates, or restarts while background tasks are queued or running, in-progress jobs may be interrupted or lost.
+>
+> This architecture does **not** use a durable distributed queue (such as Celery, Redis Streams, or RabbitMQ). For production workloads requiring high availability and persistent crash recovery across restarts, an external durable message broker and dedicated worker fleet should be deployed.
 
 ---
 
@@ -132,6 +159,90 @@ uvicorn app.main:app --reload
 ### Test the Health Endpoint
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8000/health
+```
+
+### API Usage Examples (PowerShell)
+
+#### 1. Create a Generation Job (`POST /jobs`)
+Submit a certificate generation batch. The job is created and automatically begins processing in the background:
+
+```powershell
+$body = @{
+    event_name = "Annual Tech Summit 2026"
+    issue_date = "2026-10-15"
+    recipients = @(
+        @{ recipient_name = "Alice Smith"; recipient_email = "alice@example.com" },
+        @{ recipient_name = "Bob Jones"; recipient_email = "bob@example.com" }
+    )
+} | ConvertTo-Json -Depth 5
+
+$job = Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs" -Method Post -ContentType "application/json" -Body $body
+$job
+```
+
+Example response (`201 Created`):
+```json
+{
+  "id": "c0bc522d-3cb8-48b4-b258-29ba0e52702b",
+  "event_name": "Annual Tech Summit 2026",
+  "issue_date": "2026-10-15",
+  "status": "PENDING",
+  "total_count": 2,
+  "processed_count": 0,
+  "successful_count": 0,
+  "failed_count": 0,
+  "created_at": "2026-10-11T06:05:27.123456Z",
+  "started_at": null,
+  "completed_at": null
+}
+```
+
+#### 2. Check Job Processing Status (`GET /jobs/{job_id}`)
+Check batch execution status, progress percentage, counters, and per-recipient outcomes:
+
+```powershell
+$status = Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($job.id)" -Method Get
+$status
+$status.recipients
+```
+
+Example response (`200 OK`):
+```json
+{
+  "id": "c0bc522d-3cb8-48b4-b258-29ba0e52702b",
+  "event_name": "Annual Tech Summit 2026",
+  "issue_date": "2026-10-15",
+  "status": "COMPLETED",
+  "total_count": 2,
+  "processed_count": 2,
+  "successful_count": 2,
+  "failed_count": 0,
+  "created_at": "2026-10-11T06:05:27.123456Z",
+  "started_at": "2026-10-11T06:05:27.200000Z",
+  "completed_at": "2026-10-11T06:05:27.500000Z",
+  "progress_percentage": 100.0,
+  "recipients": [
+    {
+      "id": "4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e",
+      "recipient_name": "Alice Smith",
+      "recipient_email": "alice@example.com",
+      "status": "COMPLETED",
+      "certificate_code": "CERT-A1B2C3-D4E5F6",
+      "pdf_path": "certificates/4a737f55-1f9e-4eb7-91a5-29ce4fe0a56e.pdf",
+      "error_message": null,
+      "created_at": "2026-10-11T06:05:27.123456Z",
+      "processed_at": "2026-10-11T06:05:27.350000Z"
+    }
+  ]
+}
+```
+
+#### 3. Download a Generated Certificate (`GET /jobs/{job_id}/recipients/{recipient_id}/certificate`)
+Retrieve and save the rendered vector PDF file for a completed recipient:
+
+```powershell
+$recipientId = $status.recipients[0].id
+Invoke-WebRequest -Uri "http://127.0.0.1:8000/jobs/$($job.id)/recipients/$recipientId/certificate" -OutFile "alice_certificate.pdf"
 ```
 
 ### Access Interactive Documentation (Swagger UI)

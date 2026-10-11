@@ -1,7 +1,8 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pypdf
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -12,7 +13,12 @@ from app.db.session import _get_connect_args, get_db, init_db
 from app.main import app
 from app.models.job import GenerationJob, JobStatus
 from app.models.recipient import RecipientCertificate, RecipientStatus
-from app.services.job_processor import MAX_RECIPIENTS_PER_JOB
+from app.services.certificate_generator import CertificateGeneratorService
+from app.services.job_processor import (
+    MAX_RECIPIENTS_PER_JOB,
+    JobAlreadyCompletedError,
+    JobProcessorService,
+)
 
 
 @pytest.fixture
@@ -86,15 +92,22 @@ def test_create_job_success(client: TestClient, session_factory) -> None:
     assert data["total_count"] == 2
     assert "created_at" in data
 
-    # Verify directly in the database
+    # Verify directly in the database that automatic processing completed the job
     with session_factory() as session:
         job = session.get(GenerationJob, job_id)
         assert job is not None
-        assert job.status == JobStatus.PENDING
+        assert job.status == JobStatus.COMPLETED
         assert job.total_count == 2
+        assert job.processed_count == 2
+        assert job.successful_count == 2
+        assert job.failed_count == 0
         assert len(job.recipients) == 2
         emails = {r.recipient_email for r in job.recipients}
         assert emails == {"alice@example.com", "bob@example.com"}
+        for r in job.recipients:
+            assert r.status == RecipientStatus.COMPLETED
+            assert r.certificate_code is not None
+            assert r.pdf_path is not None
 
 
 def test_create_job_empty_recipients_allowed(client: TestClient, session_factory) -> None:
@@ -436,3 +449,206 @@ def test_get_certificate_path_traversal_returns_404(
     response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
     assert response.status_code == 404
     assert "Certificate file path is invalid." in response.json()["detail"]
+
+
+def test_create_job_with_custom_issue_date_persisted_and_rendered(
+    client: TestClient, session_factory, temp_storage_dir: Path
+) -> None:
+    """Verify that a supplied issue_date is persisted and automatically processed onto rendered certificates."""
+    payload = {
+        "event_name": "International Tech Summit 2025",
+        "issue_date": "2025-06-15",
+        "recipients": [
+            {"name": "Alice Developer", "email": "alice@example.com"}
+        ],
+    }
+    response = client.post("/jobs", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    job_id = uuid.UUID(data["id"])
+    assert data["issue_date"] == "2025-06-15"
+    assert data["status"] == "PENDING"
+
+    # Verify status API reflects completed automatic processing and persisted issue_date
+    status_response = client.get(f"/jobs/{job_id}")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] == "COMPLETED"
+    assert status_data["issue_date"] == "2025-06-15"
+    assert status_data["total_count"] == 1
+    assert status_data["processed_count"] == 1
+    assert status_data["successful_count"] == 1
+
+    # Verify duplicate processing is rejected by existing claim/status mechanism
+    processor = JobProcessorService(
+        session_factory=session_factory,
+        generator_service=CertificateGeneratorService(storage_dir=temp_storage_dir),
+    )
+    with pytest.raises(JobAlreadyCompletedError):
+        processor.process_job(job_id)
+
+    # Inspect recipient record and PDF
+    with session_factory() as session:
+        recipient = session.query(RecipientCertificate).filter_by(job_id=job_id).one()
+        assert recipient.status == RecipientStatus.COMPLETED
+        pdf_path = temp_storage_dir / recipient.pdf_path
+        assert pdf_path.exists()
+
+    # Extract PDF text and verify the formatted date appears
+    reader = pypdf.PdfReader(pdf_path)
+    extracted_text = reader.pages[0].extract_text()
+    assert "Alice Developer" in extracted_text
+    assert "International Tech Summit 2025" in extracted_text
+    assert "June 15, 2025" in extracted_text
+
+
+def test_create_job_without_issue_date_uses_default_date(
+    client: TestClient, session_factory, temp_storage_dir: Path
+) -> None:
+    """Verify that omitting issue_date preserves default behavior using job creation date."""
+    payload = {
+        "event_name": "Autumn Coding Workshop",
+        "recipients": [
+            {"name": "Bob Builder", "email": "bob@example.com"}
+        ],
+    }
+    response = client.post("/jobs", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    job_id = uuid.UUID(data["id"])
+    assert data["issue_date"] is None
+    assert data["status"] == "PENDING"
+
+    # Status API returns COMPLETED for automatically processed job
+    status_response = client.get(f"/jobs/{job_id}")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] == "COMPLETED"
+    assert status_data["issue_date"] is None
+    assert status_data["successful_count"] == 1
+
+    # Verify duplicate processing is rejected by existing claim/status mechanism
+    processor = JobProcessorService(
+        session_factory=session_factory,
+        generator_service=CertificateGeneratorService(storage_dir=temp_storage_dir),
+    )
+    with pytest.raises(JobAlreadyCompletedError):
+        processor.process_job(job_id)
+
+    with session_factory() as session:
+        job = session.get(GenerationJob, job_id)
+        recipient = session.query(RecipientCertificate).filter_by(job_id=job_id).one()
+        assert recipient.status == RecipientStatus.COMPLETED
+        pdf_path = temp_storage_dir / recipient.pdf_path
+        assert pdf_path.exists()
+        expected_date_str = job.created_at.strftime("%B %d, %Y")
+
+    reader = pypdf.PdfReader(pdf_path)
+    extracted_text = reader.pages[0].extract_text()
+    assert "Bob Builder" in extracted_text
+    assert expected_date_str in extracted_text
+
+
+def test_get_certificate_error_sanitization_does_not_leak_internal_details(
+    client: TestClient, session_factory
+) -> None:
+    """Verify certificate download does not expose sensitive internal error messages or stack traces."""
+    sensitive_internal_error = (
+        "OperationalError: password authentication failed for user 'postgres' "
+        "(pwd=secret_prod_pw_9988) at /var/app/internal/db_connection.py:42"
+    )
+
+    with session_factory() as session:
+        job = GenerationJob(event_name="Security Audit Event", total_count=1)
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+        recipient = RecipientCertificate(
+            job_id=job_id,
+            recipient_name="Eve Auditor",
+            recipient_email="eve@audit.org",
+            status=RecipientStatus.FAILED,
+            error_message=sensitive_internal_error,
+        )
+        session.add(recipient)
+        session.commit()
+        recipient_id = recipient.id
+
+    response = client.get(f"/jobs/{job_id}/recipients/{recipient_id}/certificate")
+    assert response.status_code == 400
+
+    # Verify sensitive internals are sanitized from the HTTP response
+    assert "secret_prod_pw_9988" not in response.text
+    assert "db_connection.py" not in response.text
+    assert "OperationalError" not in response.text
+
+    # Safe error message returned to user
+    detail = response.json()["detail"]
+    assert f"Certificate for recipient '{recipient_id}' is not available." in detail
+    assert "Status: 'FAILED'" in detail
+
+    # Confirm the raw error message is still preserved in the persisted database record
+    with session_factory() as session:
+        saved_recipient = session.get(RecipientCertificate, recipient_id)
+        assert saved_recipient.error_message == sensitive_internal_error
+
+
+def test_create_job_automatic_processing_partial_failure(
+    client: TestClient, session_factory, temp_storage_dir: Path
+) -> None:
+    """Verify automatic background processing handles per-recipient failures without stopping other recipients."""
+    from unittest.mock import patch
+    from app.services.certificate_generator import CertificateGenerationError
+
+    real_generate = CertificateGeneratorService.generate_certificate
+
+    def mock_generate(self, recipient_name, event_name, issue_date, custom_code=None):
+        if recipient_name == "Failing Participant":
+            raise CertificateGenerationError("Simulated ReportLab rendering failure")
+        return real_generate(self, recipient_name, event_name, issue_date, custom_code)
+
+    payload = {
+        "event_name": "Resilient Processing Workshop",
+        "recipients": [
+            {"name": "Failing Participant", "email": "fail@example.com"},
+            {"name": "Winning Participant", "email": "win@example.com"},
+        ],
+    }
+
+    with patch.object(CertificateGeneratorService, "generate_certificate", mock_generate):
+        response = client.post("/jobs", json=payload)
+
+    assert response.status_code == 201
+    data = response.json()
+    job_id = uuid.UUID(data["id"])
+    assert data["status"] == "PENDING"
+    assert data["total_count"] == 2
+
+    # Status endpoint reports PARTIALLY_COMPLETED
+    status_response = client.get(f"/jobs/{job_id}")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+    assert status_data["status"] == "PARTIALLY_COMPLETED"
+    assert status_data["total_count"] == 2
+    assert status_data["processed_count"] == 2
+    assert status_data["successful_count"] == 1
+    assert status_data["failed_count"] == 1
+    assert status_data["progress_percentage"] == 100.0
+
+    # Verify recipient outcomes directly in database
+    with session_factory() as session:
+        recipients = {
+            r.recipient_name: r
+            for r in session.query(RecipientCertificate).filter_by(job_id=job_id).all()
+        }
+        failed_rec = recipients["Failing Participant"]
+        success_rec = recipients["Winning Participant"]
+
+        assert failed_rec.status == RecipientStatus.FAILED
+        assert "Simulated ReportLab rendering failure" in failed_rec.error_message
+        assert failed_rec.pdf_path is None
+
+        assert success_rec.status == RecipientStatus.COMPLETED
+        assert success_rec.pdf_path is not None
+        assert (temp_storage_dir / success_rec.pdf_path).exists()

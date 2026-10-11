@@ -1,9 +1,9 @@
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import CheckConstraint, Enum, Integer, String, Uuid
+from sqlalchemy import CheckConstraint, Date, Enum, Integer, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -71,12 +71,17 @@ class GenerationJob(Base):
         String(255),
         nullable=False,
     )
+    issue_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus, name="job_status_enum"),
         default=JobStatus.PENDING,
         nullable=False,
         index=True,
     )
+
 
     total_count: Mapped[int] = mapped_column(
         Integer,

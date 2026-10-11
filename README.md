@@ -33,7 +33,7 @@ Bulk Certificate Generator is a backend service designed to handle large-scale, 
     * `GET /jobs/{job_id}`: Tracks live progress, counter metrics, completion percentage, and recipient summaries (`recipient_id`, `name`, `email`, `status`).
     * `GET /jobs/{job_id}/recipients/{recipient_id}/certificate`: Securely streams generated certificate PDFs with strict storage containment checks and sanitized public error messages.
   * Automatic In-Process Background Processing via FastAPI `BackgroundTasks`.
-  * Comprehensive automated test suite (75 passing tests) verifying PDF validity, metadata extraction, uniqueness, security boundaries, database invariants, reliable processing, error sanitization, and API workflows.
+  * Comprehensive automated test suite (77 passed, 1 warning) verifying PDF validity, metadata extraction, uniqueness, security boundaries, database invariants, reliable processing, error sanitization, and API workflows.
 
 ---
 
@@ -123,22 +123,30 @@ When a client calls `POST /jobs`, the application creates the job, persists its 
 
 ## Setup Instructions (Windows PowerShell)
 
-### 1. Clone or Open the Repository
+### 1. Clone the Repository
 ```powershell
-cd c:\vishnuprojects\aereoAssignment
+git clone https://github.com/VishnuGurrapu/bulk-certificate-generator.git
+cd bulk-certificate-generator
 ```
 
-### 2. Activate the Virtual Environment
+### 2. Create a Virtual Environment
+```powershell
+python -m venv .venv
+```
+
+### 3. Activate the Virtual Environment
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
+*(If script execution is disabled on PowerShell, run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` first.)*
 
-### 3. Install Dependencies
+### 4. Install Dependencies
 ```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables (Optional)
+### 5. Configure Environment Variables (Optional)
 ```powershell
 Copy-Item .env.example .env
 ```
@@ -171,8 +179,8 @@ $body = @{
     event_name = "Annual Tech Summit 2026"
     issue_date = "2026-10-15"
     recipients = @(
-        @{ recipient_name = "Alice Smith"; recipient_email = "alice@example.com" },
-        @{ recipient_name = "Bob Jones"; recipient_email = "bob@example.com" }
+        @{ name = "Alice Smith"; email = "alice@example.com" },
+        @{ name = "Bob Jones"; email = "bob@example.com" }
     )
 } | ConvertTo-Json -Depth 5
 
